@@ -1,42 +1,5 @@
-# ═══════════════════════════════════════════════════════════════
-# Exorde Pipeline — сборка под локальный запуск на Debian 13 + RTX 3050 8GB
-#
-# Схема данных:
-#   (внешние скраперы) → collector:9000 → upipe:5981 → bpipe:7995 → transactioneer:8002 → Exorde
-#                                                                          │
-#                                                                          ▼
-#                                                                     vpn (SOCKS5/HTTP)
-#
-# VPN обязателен для transactioneer (загрузка в Exorde Upload API часто
-# гео-заблокирована). Для upipe/bpipe прокси по умолчанию выключен
-# (модели с HuggingFace обычно качаются напрямую быстрее) — включается
-# через USE_PROXY_UPIPE / USE_PROXY_BPIPE в .env при необходимости.
-#
-# Кэш моделей (models_cache) — bind-mount в ./models_cache на хосте
-# (а не docker named volume). Модели скачиваются один раз и лежат
-# физически на диске рядом с проектом — видны, переживают `down -v`
-# и `docker system prune`, не пропадают при удалении неймд-волюмов.
-#
-# Первый запуск (долго — собирает образы и качает ML-модели ~10-20 минут):
-#   docker compose up -d --build
-#
-# Логи:
-#   docker compose logs -f vpn
-#   docker compose logs -f collector
-#   docker compose logs -f upipe
-#   docker compose logs -f bpipe
-#   docker compose logs -f transactioneer
-#
-# Остановка:
-#   docker compose down
-# ═══════════════════════════════════════════════════════════════
-
 services:
 
-  # ─────────────────────────────────────────────────────────────
-  # VPN — Xray-core (VLESS + REALITY + Vision), поднимает SOCKS5/HTTP
-  # прокси, доступный другим контейнерам как http://vpn:1081 / socks5://vpn:1080
-  # ─────────────────────────────────────────────────────────────
   vpn:
     build:
       context: ./vpn
@@ -49,10 +12,6 @@ services:
       DISABLE_PQV:   "${VPN_DISABLE_PQV:-false}"
       XRAY_LOG_LEVEL: "${VPN_LOG_LEVEL:-warning}"
     ports:
-      # Проброшено на хост исключительно для ручной проверки
-      # (curl -x socks5h://127.0.0.1:1080 ...). Для самого пайплайна
-      # не требуется — сервисы обращаются к vpn:1080/1081 напрямую
-      # через docker-сеть.
       - "127.0.0.1:1080:1080"
       - "127.0.0.1:1081:1081"
     healthcheck:
@@ -62,9 +21,6 @@ services:
       retries: 8
       start_period: 10s
 
-  # ─────────────────────────────────────────────────────────────
-  # TRANSACTIONEER — загружает батчи в Exorde (через VPN)
-  # ─────────────────────────────────────────────────────────────
   transactioneer:
     build:
       context: ./transactioneer
@@ -90,11 +46,6 @@ services:
       retries: 10
       start_period: 15s
 
-  # ─────────────────────────────────────────────────────────────
-  # BPIPE — ML пайплайн (эмбеддинги, сентимент, эмоции, zero-shot и т.д.)
-  # Один инстанс — второй (bpipe_2) в самом низу файла закомментирован:
-  # на RTX 3050 8GB две копии моделей одновременно не влезут.
-  # ─────────────────────────────────────────────────────────────
   bpipe:
     build:
       context: ./bpipe
@@ -132,9 +83,87 @@ services:
               count: 1
               capabilities: [gpu]
 
-  # ─────────────────────────────────────────────────────────────
-  # UPIPE — NLP (перевод, keywords, токен-фильтрация, классификация)
-  # ─────────────────────────────────────────────────────────────
+  # bpipe_2 / bpipe_3 включаются через COMPOSE_PROFILES, который
+  # выставляет run.sh на основе BPIPE_REPLICAS из .env. Руками через
+  # `docker compose up` без run.sh не поднимутся.
+  bpipe_2:
+    profiles: ["bpipe2"]
+    build:
+      context: ./bpipe
+    container_name: bpipe_2
+    restart: unless-stopped
+    depends_on:
+      transactioneer:
+        condition: service_healthy
+    environment:
+      BPIPE_PORT:              "7996"
+      TRANSACTIONEER_URL:      "http://transactioneer:8002"
+      FIXED_BATCH_SIZE:        "${FIXED_BATCH_SIZE:-6}"
+      BATCH_TIMEOUT_SECONDS:   "${BATCH_TIMEOUT_SECONDS:-3.0}"
+      MAX_QUEUE_SIZE:          "${MAX_QUEUE_SIZE:-100}"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      CUDA_LAUNCH_BLOCKING:    "0"
+      MAIN_ADDRESS:            "${MAIN_ADDRESS}"
+      USE_PROXY:               "${USE_PROXY_BPIPE:-false}"
+      PROXY_URL:               "http://vpn:1081"
+    expose:
+      - "7996"
+    volumes:
+      - ./models_cache:/root/.cache
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:7996/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  bpipe_3:
+    profiles: ["bpipe3"]
+    build:
+      context: ./bpipe
+    container_name: bpipe_3
+    restart: unless-stopped
+    depends_on:
+      transactioneer:
+        condition: service_healthy
+    environment:
+      BPIPE_PORT:              "7997"
+      TRANSACTIONEER_URL:      "http://transactioneer:8002"
+      FIXED_BATCH_SIZE:        "${FIXED_BATCH_SIZE:-6}"
+      BATCH_TIMEOUT_SECONDS:   "${BATCH_TIMEOUT_SECONDS:-3.0}"
+      MAX_QUEUE_SIZE:          "${MAX_QUEUE_SIZE:-100}"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      CUDA_LAUNCH_BLOCKING:    "0"
+      MAIN_ADDRESS:            "${MAIN_ADDRESS}"
+      USE_PROXY:               "${USE_PROXY_BPIPE:-false}"
+      PROXY_URL:               "http://vpn:1081"
+    expose:
+      - "7997"
+    volumes:
+      - ./models_cache:/root/.cache
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:7997/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Round-robin по конкретным URL из BPIPE_URLS (см. upipe.py itertools.cycle) —
+  # ровное распределение элементов, не зависит от DNS/keepalive.
   upipe:
     build:
       context: ./upipe
@@ -145,7 +174,7 @@ services:
         condition: service_healthy
     environment:
       UPIPE_PORT:               "5981"
-      BPIPE_URLS:               "http://bpipe:7995/"
+      BPIPE_URLS:               "${BPIPE_URLS:-http://bpipe:7995/}"
       UPIPE_WORKERS:            "${UPIPE_WORKERS:-2}"
       UPIPE_QUEUE_LIMIT:        "${UPIPE_QUEUE_LIMIT:-200}"
       MAX_DEPTH_CLASSIFICATION: "${MAX_DEPTH_CLASSIFICATION:-2}"
@@ -163,10 +192,6 @@ services:
       retries: 60
       start_period: 60s
 
-  # ─────────────────────────────────────────────────────────────
-  # COLLECTOR — принимает данные (от твоих скраперов/источников),
-  # фильтрует, передаёт в upipe
-  # ─────────────────────────────────────────────────────────────
   collector:
     build:
       context: ./collector
@@ -190,49 +215,3 @@ services:
       timeout: 5s
       retries: 10
       start_period: 15s
-
-  # ─────────────────────────────────────────────────────────────
-  # BPIPE_2 — второй GPU-инстанс. ОТКЛЮЧЕН по умолчанию: на RTX 3050
-  # 8GB одновременная загрузка двух копий всех моделей (~4-6GB каждая
-  # с учётом ORT+CUDA контекста) может привести к CUDA OOM.
-  #
-  # Если апгрейднешь GPU (например на 16GB+) — раскомментируй этот блок
-  # и в сервисе upipe поменяй:
-  #   BPIPE_URLS: "http://bpipe:7995/,http://bpipe_2:7996/"
-  # и добавь в depends_on upipe:
-  #   bpipe_2:
-  #     condition: service_healthy
-  # ─────────────────────────────────────────────────────────────
-  # bpipe_2:
-  #   build:
-  #     context: ./bpipe
-  #   container_name: bpipe_2
-  #   restart: unless-stopped
-  #   depends_on:
-  #     transactioneer:
-  #       condition: service_healthy
-  #   environment:
-  #     BPIPE_PORT:              "7996"
-  #     TRANSACTIONEER_URL:      "http://transactioneer:8002"
-  #     FIXED_BATCH_SIZE:        "${FIXED_BATCH_SIZE:-6}"
-  #     BATCH_TIMEOUT_SECONDS:   "${BATCH_TIMEOUT_SECONDS:-3.0}"
-  #     MAX_QUEUE_SIZE:          "${MAX_QUEUE_SIZE:-100}"
-  #     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
-  #     MAIN_ADDRESS:            "${MAIN_ADDRESS}"
-  #   expose:
-  #     - "7996"
-  #   volumes:
-  #     - ./models_cache:/root/.cache
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-sf", "http://localhost:7996/health"]
-  #     interval: 15s
-  #     timeout: 5s
-  #     retries: 60
-  #     start_period: 60s
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - driver: nvidia
-  #             count: 1
-  #             capabilities: [gpu]

@@ -1,0 +1,208 @@
+"""
+Collector — мост между Twitter-скрапером и upipe.
+
+Схема:
+  scraper  → POST /store_item (port 9000)  → collector
+  collector → POST /         (port 5981)  → upipe
+
+Фильтрует только английские твиты перед отправкой в upipe.
+"""
+import asyncio
+import logging
+import os
+import sys
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+
+import aiohttp
+import orjson
+from aiohttp import web
+from langdetect import detect, DetectorFactory
+
+DetectorFactory.seed = 0  # Детерминированное определение языка
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [collector] %(levelname)s %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger(__name__)
+
+UPIPE_URL       = os.getenv("UPIPE_URL", "http://127.0.0.1:5981/")
+COLLECTOR_PORT  = int(os.getenv("COLLECTOR_PORT", "9000"))
+LANG_FILTER     = os.getenv("LANG_FILTER", "en")          # "" = не фильтровать
+MIN_TEXT_LEN        = int(os.getenv("MIN_TEXT_LEN", "20"))       # Минимальная длина текста
+MAX_TEXT_LEN         = int(os.getenv("MAX_TEXT_LEN", "20000"))    # Макс. длина текста (символы) — защита от экстремально больших пейлоадов
+MAX_OLDNESS_SECONDS = int(os.getenv("MAX_OLDNESS_SECONDS", "86400"))  # Макс. возраст твита (сек). 86400 = 24ч
+
+_thread_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="langdetect")
+
+# ─── Дедупликация ─────────────────────────────────────────────
+_seen_ids: OrderedDict = OrderedDict()
+_DEDUP_MAX_SIZE = 100_000
+
+# ─── Статистика ───────────────────────────────────────────────
+_stats = {"received": 0, "forwarded": 0, "filtered_lang": 0, "filtered_old": 0, "filtered_dup": 0, "truncated": 0, "errors": 0, "dropped": 0}
+_session: aiohttp.ClientSession | None = None
+
+
+def _detect_lang(text: str) -> str:
+    try:
+        return detect(text)
+    except Exception:
+        return "unknown"
+
+
+async def detect_lang_async(text: str) -> str:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_thread_pool, _detect_lang, text)
+
+
+async def forward_to_upipe(item: dict) -> bool:
+    """Отправляет item в upipe. Возвращает True при успехе."""
+    global _session
+    if _session is None:
+        return False
+    try:
+        async with _session.post(UPIPE_URL, data=orjson.dumps(item),
+                                  headers={"Content-Type": "application/json"}) as resp:
+            if 200 <= resp.status < 300:
+                return True
+            log.warning(f"upipe ответил {resp.status}")
+            return False
+    except aiohttp.ClientConnectorError:
+        log.error(f"❌ upipe недоступен: {UPIPE_URL}")
+        return False
+    except Exception as e:
+        log.debug(f"Ошибка пересылки: {e}")
+        return False
+
+
+def _parse_created_at(created_at_str: str) -> datetime | None:
+    """Парсит ISO8601 строку created_at в datetime (UTC). Возвращает None при ошибке."""
+    if not created_at_str:
+        return None
+    try:
+        # Формат: 2024-01-15T12:00:00.000Z или 2024-01-15T12:00:00Z
+        s = created_at_str.rstrip("Z")
+        if "." in s:
+            dt = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%f")
+        else:
+            dt = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S")
+        return dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+async def handle_store_item(request: web.Request) -> web.Response:
+    global _stats
+    try:
+        item = await request.json()
+    except Exception as e:
+        return web.json_response({"error": f"Invalid JSON: {e}"}, status=400)
+
+    _stats["received"] += 1
+    content = item.get("content", "")
+
+    # Дедупликация по external_id
+    ext_id = item.get("external_id", "")
+    if ext_id:
+        if ext_id in _seen_ids:
+            _stats["filtered_dup"] += 1
+            log.debug(f"♻️ Дубликат: {ext_id}")
+            return web.json_response({"message": "duplicate"}, status=200)
+        # Добавляем в кэш, при переполнении чистим старую половину
+        _seen_ids[ext_id] = True
+        _seen_ids.move_to_end(ext_id)
+        if len(_seen_ids) > _DEDUP_MAX_SIZE:
+            # FIFO eviction — удаляем старую половину без блокирующей сортировки
+            for _ in range(_DEDUP_MAX_SIZE // 2):
+                _seen_ids.popitem(last=False)
+
+    # Пропускаем слишком короткие тексты
+    if len(content) < MIN_TEXT_LEN:
+        return web.json_response({"message": "skipped_short"}, status=200)
+
+    # Обрубаем экстремально большие тексты (защита от абьюза/DoS ещё до
+    # перевода и токенизации — точная обрезка по токенам модели делается
+    # позже, в upipe, но здесь отсекаем совсем неадекватные объёмы дёшево)
+    if len(content) > MAX_TEXT_LEN:
+        content = content[:MAX_TEXT_LEN]
+        item["content"] = content
+        _stats["truncated"] = _stats.get("truncated", 0) + 1
+
+    # Фильтруем устаревшие твиты
+    created_at_str = item.get("created_at", "")
+    tweet_dt = _parse_created_at(created_at_str)
+    if tweet_dt is not None:
+        age_seconds = (datetime.now(timezone.utc) - tweet_dt).total_seconds()
+        if age_seconds > MAX_OLDNESS_SECONDS:
+            _stats["filtered_old"] += 1
+            log.debug(f"🕒 Устарел ({age_seconds/3600:.1f}ч): {content[:60]}")
+            return web.json_response({"message": "filtered_old"}, status=200)
+    else:
+        log.warning(f"⚠️ Не удалось распарсить created_at: {created_at_str!r}")
+
+    # Определяем язык (если фильтрация включена)
+    if LANG_FILTER:
+        lang = await detect_lang_async(content)
+        if lang != LANG_FILTER:
+            _stats["filtered_lang"] += 1
+            log.debug(f"🔇 Отфильтрован ({lang}): {content[:60]}")
+            return web.json_response({"message": "filtered_language"}, status=200)
+
+    # Пересылаем в upipe
+    ok = await forward_to_upipe(item)
+    if ok:
+        _stats["forwarded"] += 1
+        if _stats["forwarded"] % 50 == 0:
+            log.info(
+                f"📊 recv={_stats['received']} fwd={_stats['forwarded']} "
+                f"lang={_stats['filtered_lang']} old={_stats['filtered_old']} "
+                f"dup={_stats['filtered_dup']} dropped={_stats['dropped']}"
+            )
+    else:
+        _stats["errors"] += 1
+        _stats["dropped"] += 1
+        if _stats["dropped"] % 10 == 0:
+            log.warning(
+                f"⚠️  Потеряно элементов (upipe недоступен/503): {_stats['dropped']}"
+            )
+
+    return web.json_response({"message": "OK"}, status=200)
+
+
+async def handle_health(request: web.Request) -> web.Response:
+    return web.json_response({
+        "status": "ok",
+        "stats": _stats,
+        "upipe": UPIPE_URL,
+    })
+
+
+async def on_startup(app: web.Application):
+    global _session
+    connector = aiohttp.TCPConnector(limit=20, keepalive_timeout=60)
+    _session = aiohttp.ClientSession(connector=connector)
+    log.info(f"🚀 Collector запущен на порту {COLLECTOR_PORT}")
+    log.info(f"   Пересылает в upipe: {UPIPE_URL}")
+    log.info(f"   Фильтр языка: '{LANG_FILTER}' (пусто = без фильтра)")
+    log.info(f"   Макс. возраст твита: {MAX_OLDNESS_SECONDS}с ({MAX_OLDNESS_SECONDS/3600:.1f}ч)")
+
+
+async def on_shutdown(app: web.Application):
+    global _session
+    if _session:
+        await _session.close()
+    log.info(f"📊 Итог: {_stats}")
+
+
+app = web.Application(client_max_size=10 * 1024 * 1024)
+app.router.add_post("/store_item", handle_store_item)
+app.router.add_get("/health", handle_health)
+app.on_startup.append(on_startup)
+app.on_shutdown.append(on_shutdown)
+
+if __name__ == "__main__":
+    web.run_app(app, host="0.0.0.0", port=COLLECTOR_PORT, print=None)

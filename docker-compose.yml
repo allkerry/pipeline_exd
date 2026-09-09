@@ -12,6 +12,11 @@
 # (модели с HuggingFace обычно качаются напрямую быстрее) — включается
 # через USE_PROXY_UPIPE / USE_PROXY_BPIPE в .env при необходимости.
 #
+# Кэш моделей (models_cache) — bind-mount в ./models_cache на хосте
+# (а не docker named volume). Модели скачиваются один раз и лежат
+# физически на диске рядом с проектом — видны, переживают `down -v`
+# и `docker system prune`, не пропадают при удалении неймд-волюмов.
+#
 # Первый запуск (долго — собирает образы и качает ML-модели ~10-20 минут):
 #   docker compose up -d --build
 #
@@ -112,7 +117,7 @@ services:
     expose:
       - "7995"
     volumes:
-      - models_cache:/root/.cache
+      - ./models_cache:/root/.cache
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:7995/health"]
       interval: 15s
@@ -150,7 +155,7 @@ services:
     expose:
       - "5981"
     volumes:
-      - models_cache:/root/.cache
+      - ./models_cache:/root/.cache
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:5981/health"]
       interval: 15s
@@ -217,7 +222,7 @@ services:
   #   expose:
   #     - "7996"
   #   volumes:
-  #     - models_cache:/root/.cache
+  #     - ./models_cache:/root/.cache
   #   healthcheck:
   #     test: ["CMD", "curl", "-sf", "http://localhost:7996/health"]
   #     interval: 15s
@@ -231,6 +236,3 @@ services:
   #           - driver: nvidia
   #             count: 1
   #             capabilities: [gpu]
-
-volumes:
-  models_cache:

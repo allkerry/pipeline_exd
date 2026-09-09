@@ -8,8 +8,7 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir \
     "aiohttp>=3.9.0" \
-    "orjson>=3.9.0" \
-    "langdetect>=1.0.9"
+    "orjson>=3.9.0"
 
 COPY collector.py .
 

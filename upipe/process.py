@@ -3,7 +3,7 @@ from preprocess import preprocess
 from translate import translate
 from extract_keywords import extract_keywords
 from zero_shot import zero_shot
-from evaluate_token_count import truncate_to_token_limit, MAX_MODEL_TOKENS
+from evaluate_token_count import evaluate_token_count, MAX_MODEL_TOKENS
 from exorde_data import Translation, Classification, Keywords, Processed, Item, Translated
 
 def process(item: Item, lab_configuration, max_depth_classification) -> Processed:
@@ -14,27 +14,9 @@ def process(item: Item, lab_configuration, max_depth_classification) -> Processe
         if translation.translation == "":
             raise ValueError("No content to work with")
 
-        # ─── Фильтрация/обрезка по токенам ──────────────────────
-        # Модели в bpipe (DeBERTa zero-shot, RoBERTa emotion/irony/text-type,
-        # sentiment-модели) падают или ведут себя непредсказуемо на входах
-        # длиннее их max_position_embeddings (обычно 512 токенов). Один
-        # длинный текст в батче может уронить обработку всего батча.
-        # Поэтому здесь принудительно обрезаем translation до безопасного
-        # числа токенов — bpipe.tag() дополнительно подстрахован
-        # truncation=True на случай, если что-то просочится.
-        truncated_text, n_tokens, was_truncated = truncate_to_token_limit(
-            translation.translation, MAX_MODEL_TOKENS
-        )
-        if was_truncated:
-            translation = Translation(
-                language=translation.language,
-                translation=Translated(truncated_text),
-            )
-            logging.info(
-                f"✂️ Текст обрезан по токенам (лимит={MAX_MODEL_TOKENS}, итог={n_tokens})"
-            )
-        if not truncated_text.strip():
-            raise ValueError("No content to work with after token truncation")
+        n_tokens = evaluate_token_count(translation.translation)
+        if n_tokens > MAX_MODEL_TOKENS:
+            raise ValueError(f"Токен-лимит превышен ({n_tokens} > {MAX_MODEL_TOKENS}), item отброшен")
 
         top_keywords: Keywords = extract_keywords(translation)
         classification: Classification = zero_shot(translation, lab_configuration, max_depth=max_depth_classification)

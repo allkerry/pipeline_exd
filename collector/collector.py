@@ -83,9 +83,8 @@ def _passes_lang_filter(content: str) -> bool:
     try:
         return detect(content) == LANG_FILTER
     except LangDetectException:
-        # Слишком короткий/мусорный текст для langdetect — не блокируем,
-        # длину и мусор и так отсеивают MIN_TEXT_LEN и upipe дальше по цепочке.
-        return True
+        # Неопределяемый язык — не пропускаем дальше без проверки, дропаем.
+        return False
 
 
 async def handle_store_item(request: web.Request) -> web.Response:

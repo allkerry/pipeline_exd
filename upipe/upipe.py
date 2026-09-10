@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from exorde_data import Item, CreatedAt, Content, Domain, Url, Title, ExternalId, Author, ExternalParentId
 from process import process
+from translate import NonEnglishError
 from lab_initialization import lab_initialization
 
 logging.basicConfig(
@@ -45,7 +46,7 @@ _thread_pool: ThreadPoolExecutor | None = None
 _bpipe_cycle: itertools.cycle | None = None
 _bpipe_lock = asyncio.Lock()
 
-_stats = {"received": 0, "processed": 0, "forwarded": 0, "errors": 0, "dropped": 0}
+_stats = {"received": 0, "processed": 0, "forwarded": 0, "errors": 0, "dropped": 0, "filtered_lang": 0}
 
 
 def _process_sync(item: Item, lab_config: dict) -> dict:
@@ -131,6 +132,10 @@ async def worker_loop(worker_id: int):
                 else:
                     _stats["errors"] += 1
 
+            except NonEnglishError as e:
+                _stats["filtered_lang"] += 1
+                log.debug(f"🌐 [{worker_id}] Не-английский текст отброшен: {e}")
+
             except Exception as e:
                 _stats["errors"] += 1
                 log.warning(f"⚠️ [{worker_id}] Ошибка обработки: {e}")
@@ -141,7 +146,8 @@ async def worker_loop(worker_id: int):
             if _stats["forwarded"] % 25 == 0 and _stats["forwarded"] > 0:
                 log.info(
                     f"📊 recv={_stats['received']} proc={_stats['processed']} "
-                    f"fwd={_stats['forwarded']} err={_stats['errors']} dropped={_stats['dropped']}"
+                    f"fwd={_stats['forwarded']} err={_stats['errors']} "
+                    f"lang={_stats['filtered_lang']} dropped={_stats['dropped']}"
                 )
 
         except Exception as e:

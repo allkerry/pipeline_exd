@@ -6,6 +6,7 @@ Collector — мост между Twitter-скрапером и upipe.
   collector → POST /         (port 5981)  → upipe
 """
 import asyncio
+import hashlib
 import logging
 import os
 import sys
@@ -40,6 +41,12 @@ _DEDUP_MAX_SIZE = 100_000
 # ─── Статистика ───────────────────────────────────────────────
 _stats = {"received": 0, "forwarded": 0, "filtered_old": 0, "filtered_dup": 0, "filtered_lang": 0, "truncated": 0, "errors": 0, "dropped": 0}
 _session: aiohttp.ClientSession | None = None
+
+
+def _hash_author(author: str) -> str:
+    if not author:
+        return ""
+    return hashlib.sha1(author.encode("utf-8")).hexdigest()
 
 
 async def forward_to_upipe(item: dict) -> bool:
@@ -96,6 +103,8 @@ async def handle_store_item(request: web.Request) -> web.Response:
 
     _stats["received"] += 1
     content = item.get("content", "")
+
+    item["author"] = _hash_author(item.get("author", ""))
 
     ext_id = item.get("external_id", "")
     if ext_id:

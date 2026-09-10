@@ -22,10 +22,6 @@ except Exception as e:
     logging.warning(f"[ORT] preload_dlls() недоступен/не сработал ({e}) — "
                      f"полагаемся на LD_LIBRARY_PATH из Dockerfile")
 
-# Диагностика: print_debug_info() печатает версию сборки ORT, под какую
-# CUDA/cuDNN она собрана, что реально нашлось на диске/в site-packages.
-# Временно оставляем это здесь при отладке провалов CUDAExecutionProvider —
-# без этого приходится гадать вслепую.
 try:
     logging.info(f"[ORT] Version: {onnxruntime.__version__}")
     logging.info(f"[ORT] Build info: {onnxruntime.get_build_info() if hasattr(onnxruntime, 'get_build_info') else 'n/a'}")
@@ -62,20 +58,8 @@ def initialize_models(device):
         os.environ["HTTPS_PROXY"] = PROXY_URL
         logging.info(f"[TAGGING] Proxy: {PROXY_URL}")
 
-    # ONNX провайдер: только для sentence-transformer ниже (у него ЕСТЬ
-    # готовый .onnx на HuggingFace, конвертация на лету не требуется).
     ort_provider = "CUDAExecutionProvider" if device >= 0 else "CPUExecutionProvider"
     logging.info(f"[TAGGING] ORT provider (для sentence-transformer): {ort_provider}")
-
-    # ВАЖНО: остальные модели ниже (zero-shot, Emotion/Irony/TextType,
-    # fdb, gdb) грузятся через обычный transformers.pipeline(..., device=...)
-    # на PyTorch, а НЕ через ORTModelForSequenceClassification(export=True).
-    # У них нет готового .onnx на HuggingFace — optimum пытался бы
-    # сконвертировать их из PyTorch в ONNX прямо при старте контейнера, а
-    # этот путь (torch.onnx.export → dynamo → onnxscript → onnx_ir) оказался
-    # крайне хрупким к точным версиям пачки взаимозависимых пакетов и
-    # регулярно падал с разными ошибками на разных этапах экспорта.
-    # PyTorch на GPU и без ONNX работает быстро и без этой возни.
 
     models = {}
 
@@ -88,15 +72,12 @@ def initialize_models(device):
     )
     clear_gpu_memory()
 
-    torch_device = device  # -1 = CPU, 0 = cuda:0 — формат, который ждёт transformers.pipeline
+    torch_device = device
 
     # ── Zero-shot classification (DeBERTa, обычный PyTorch) ───────────────────
     logging.info("[TAGGING] Loading: MoritzLaurer/deberta-v3-xsmall-zeroshot-v1.1-all-33")
     _zs_id = "MoritzLaurer/deberta-v3-xsmall-zeroshot-v1.1-all-33"
     _zs_tokenizer = AutoTokenizer.from_pretrained(_zs_id)
-    # Явно фиксируем максимальную длину — некоторые чекпоинты не объявляют
-    # её в конфиге корректно, из-за чего пайплайн может не обрезать длинные
-    # входы и упасть с IndexError на длинных текстах.
     if not _zs_tokenizer.model_max_length or _zs_tokenizer.model_max_length > 100_000:
         _zs_tokenizer.model_max_length = 512
     else:
@@ -110,14 +91,12 @@ def initialize_models(device):
     )
     clear_gpu_memory()
 
-    # ── Text classification models (обычный PyTorch) ──────────────────────────
     text_classification_models = [
         ("Emotion",  "SamLowe/roberta-base-go_emotions"),
         ("Irony",    "cardiffnlp/twitter-roberta-base-irony"),
         ("TextType", "marieke93/MiniLM-evidence-types"),
     ]
 
-    # Некоторые модели требуют PR-ветки (safetensors только там)
     SNAPSHOT_REVISIONS = {
         "cardiffnlp/twitter-roberta-base-irony": "refs/pr/3",
         "marieke93/MiniLM-evidence-types":       "refs/pr/1",
@@ -150,17 +129,12 @@ def initialize_models(device):
         )
         clear_gpu_memory()
 
-    # ── BERT tokenizer (CPU, только для токенизации) ───────────────────────────
-    logging.info("[TAGGING] Loading tokenizer: bert-large-uncased")
-    models["bert_tokenizer"] = AutoTokenizer.from_pretrained("bert-large-uncased")
-
     # ── VADER & FinVADER (CPU, нет ONNX версии) ───────────────────────────────
     logging.info("[TAGGING] Loading: vaderSentiment")
     models["sentiment_analyzer"] = SentimentIntensityAnalyzer()
     logging.info("[TAGGING] Loading: finvader")
     models["finvader_analyzer"] = finvader
 
-    # Дополнительные лексиконы для VADER
     try:
         emoji_lexicon = hf_hub_download(
             repo_id="ExordeLabs/SentimentDetection",
@@ -262,7 +236,9 @@ def lab_initialization():
         logging.info("[LAB INIT] Classification labels loaded.")
     except Exception as e:
         logging.error(f"[LAB INIT] Labels fetch failed: {e}")
-        labels = {}
+        # Пустой labeldict → classification_labels=[] в tag.py → zs_pipe падает →
+        # весь батч теряется. Фолбэк не даёт batch'у молча обнулиться при недоступности GitHub.
+        labels = {"other": "fallback label used when class_names.json is unreachable"}
 
     lab_configuration = {
         "labeldict":           labels,

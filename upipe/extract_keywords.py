@@ -1,4 +1,4 @@
-import yake, re, string, nltk
+import yake, re, string
 from exorde_data import Keywords, Translation
 
 MAX_KEYWORD_LENGTH = 100

@@ -1,7 +1,7 @@
 import logging
 import cupy as cp
 import torch
-import gc  # Для сборки мусора
+import gc
 from sentence_transformers import SentenceTransformer
 from transformers import pipeline
 from finvader import finvader
@@ -10,61 +10,38 @@ from exorde_compat import (
     Classification, LanguageScore, Sentiment, Embedding, TextType,
     Emotion, Irony, Age, Gender, Analysis,
 )
-from exorde_compat import (
-    Classification, LanguageScore, Sentiment, Embedding, TextType,
-    Emotion, Irony, Age, Gender, Analysis,
-)
-from exorde_compat import (
-    Classification, LanguageScore, Sentiment, Embedding, TextType,
-    Emotion, Irony, Age, Gender, Analysis,
-)
-from exorde_compat import (
-    Classification, LanguageScore, Sentiment, Embedding,
-    TextType, Emotion, Irony, Age, Gender, Analysis,
-)
 
 logging.basicConfig(level=logging.INFO)
 
 def clear_gpu_memory():
     """Очистка GPU памяти"""
     try:
-        # Очистка PyTorch кэша
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-
-        # Очистка CuPy кэша
         cp.get_default_memory_pool().free_all_blocks()
         cp.get_default_pinned_memory_pool().free_all_blocks()
-
-        # Сборка мусора Python
         gc.collect()
-
         logging.debug("GPU memory cleared")
     except Exception as e:
         logging.warning(f"Error clearing GPU memory: {e}")
 
 def get_gpu_memory_info():
-    """Получение информации о GPU памяти"""
     if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-        reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
         return allocated, reserved
     return 0, 0
 
 def tag(documents: list[str], lab_configuration):
-    # Ensure documents are valid
     assert documents is not None and len(documents) > 0
     logging.info(f"Starting Tagging Batch pipeline for {len(documents)} documents...")
 
-    # Получение информации о памяти в начале
     allocated_start, reserved_start = get_gpu_memory_info()
     logging.info(f"GPU Memory at start - Allocated: {allocated_start:.2f}GB, Reserved: {reserved_start:.2f}GB")
 
-    # Loading models from lab configuration
     models = lab_configuration["models"]
 
-    # Load models
     model = models['sentence_transformer']
     zs_pipe = models['zs_pipe']
     classification_labels = list(lab_configuration["labeldict"].keys())
@@ -78,23 +55,16 @@ def tag(documents: list[str], lab_configuration):
         "TextType": models['TextType']
     }
 
-    # Возвращаем оригинальный размер батча - больший размер работает лучше
-    batch_size = 15  # Восстанавливаем оригинальный размер
+    batch_size = 15
     logging.info(f"Using batch_size: {batch_size} for {len(documents)} documents")
 
     # Защита от ошибок на слишком длинных текстах: даже если что-то
     # просочилось мимо обрезки по токенам в upipe (evaluate_token_count),
-    # truncation=True здесь не даст HF-пайплайнам упасть с
-    # "The expanded size of the tensor..." на входе длиннее лимита модели.
-    # max_length=512 — стандартный потолок для всех используемых здесь
-    # BERT/RoBERTa/DeBERTa моделей.
+    # truncation=True здесь не даст HF-пайплайнам упасть на входе длиннее лимита.
     HF_SAFETY_KWARGS = {"truncation": True, "max_length": 512}
 
     try:
-        # Embeddings в batch с проверкой памяти
         logging.info("Processing embeddings...")
-        # SentenceTransformer сам обрезает по model.max_seq_length, но
-        # выставляем это явно на случай нестандартного чекпоинта.
         try:
             if getattr(model, "max_seq_length", None) and model.max_seq_length > 512:
                 model.max_seq_length = 512
@@ -105,26 +75,21 @@ def tag(documents: list[str], lab_configuration):
             convert_to_tensor=True,
             device='cuda',
             batch_size=batch_size,
-            show_progress_bar=False  # Отключаем progress bar для экономии памяти
+            show_progress_bar=False
         )
         embedding_vectors = embedding_vectors.cpu().numpy()
 
-        # Принудительная очистка после embeddings
         clear_gpu_memory()
         allocated_after_emb, _ = get_gpu_memory_info()
         logging.info(f"GPU Memory after embeddings: {allocated_after_emb:.2f}GB")
 
-        # Zero-shot classification в batch.
-        # ВАЖНО: ZeroShotClassificationPipeline в разных версиях transformers
-        # по-разному принимает truncation/max_length как kwargs при вызове
-        # (в части версий это даёт TypeError) — поэтому здесь НЕ передаём
-        # HF_SAFETY_KWARGS явно. Защита от переполнения обеспечивается
-        # tokenizer.model_max_length=512, выставленным в lab_initialization.py,
-        # плюс упреждающей обрезкой текста в upipe (evaluate_token_count).
+        # ZeroShotClassificationPipeline в разных версиях transformers
+        # по-разному принимает truncation/max_length как kwargs (TypeError в части
+        # версий) — поэтому HF_SAFETY_KWARGS здесь не передаём. Защита обеспечена
+        # tokenizer.model_max_length=512 в lab_initialization.py + обрезкой в upipe.
         classification_results = zs_pipe(documents, candidate_labels=classification_labels, batch_size=batch_size)
         clear_gpu_memory()
 
-        # Text classification models в batch
         logging.info("Processing text classification...")
         text_type_results = text_classification_models['TextType'](documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
         clear_gpu_memory()
@@ -135,7 +100,6 @@ def tag(documents: list[str], lab_configuration):
         irony_results = text_classification_models['Irony'](documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
         clear_gpu_memory()
 
-        # Sentiment analysis в batch
         logging.info("Processing sentiment analysis...")
         fdb_predictions = fdb_pipe(documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
         clear_gpu_memory()
@@ -143,7 +107,6 @@ def tag(documents: list[str], lab_configuration):
         gdb_predictions = gdb_pipe(documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
         clear_gpu_memory()
 
-        # VADER и FinVADER (CPU операции)
         logging.info("Processing VADER sentiment...")
         vader_scores = [sentiment_analyzer.polarity_scores(text)["compound"] for text in documents]
         finvader_scores = [finvader(text, use_sentibignomics=True, use_henry=True, indicator='compound') for text in documents]
@@ -151,7 +114,6 @@ def tag(documents: list[str], lab_configuration):
     except torch.cuda.OutOfMemoryError as e:
         logging.error(f"CUDA OOM Error during model inference: {e}")
         clear_gpu_memory()
-        # Возвращаем пустые результаты или fallback
         return []
     except Exception as e:
         logging.error(f"Error during model inference: {e}")
@@ -163,17 +125,14 @@ def tag(documents: list[str], lab_configuration):
 
     for idx, text in enumerate(documents):
         try:
-            # Embedding
             embedding_vector = embedding_vectors[idx]
             embedding = Embedding(list(embedding_vector.astype(float)))
 
-            # Classification
             classification_result = classification_results[idx]
             top_label = classification_result["labels"][0]
             top_score = round(classification_result["scores"][0], 4)
             classification = Classification(label=top_label, score=top_score)
 
-            # Text Type
             text_type_result = [(y["label"], float(y["score"])) for y in text_type_results[idx]]
             types = {item[0]: item[1] for item in text_type_result}
             text_type = TextType(
@@ -186,7 +145,6 @@ def tag(documents: list[str], lab_configuration):
                 study=types.get("Statistics/Study", 0.0),
             )
 
-            # Emotion
             emotion_result = [(y["label"], float(y["score"])) for y in emotion_results[idx]]
             emotions = {item[0]: item[1] for item in emotion_result}
             emotions = {k: round(v, 4) for k, v in emotions.items()}
@@ -220,7 +178,6 @@ def tag(documents: list[str], lab_configuration):
                 nervousness=emotions.get("nervousness", 0.0),
             )
 
-            # Irony
             irony_result = [(y["label"], float(y["score"])) for y in irony_results[idx]]
             ironies = {item[0]: item[1] for item in irony_result}
             irony = Irony(
@@ -228,7 +185,6 @@ def tag(documents: list[str], lab_configuration):
                 non_irony=ironies.get("non_irony", 0.0)
             )
 
-            # Sentiments
             vader_sent_score = round(vader_scores[idx], 2)
             fin_vader_sent_score = round(finvader_scores[idx], 2)
 
@@ -242,7 +198,6 @@ def tag(documents: list[str], lab_configuration):
 
             compounded_fin_sentiment = round((0.70 * fdb_sent_score + 0.30 * fin_vader_sent_score), 2)
 
-            # Compute the compounded sentiment score based on thresholds
             if abs(compounded_fin_sentiment) >= 0.6:
                 sentiment_score = round((0.30 * gdb_sent_score + 0.10 * vader_sent_score + 0.60 * compounded_fin_sentiment), 2)
             elif abs(compounded_fin_sentiment) >= 0.4:
@@ -254,10 +209,8 @@ def tag(documents: list[str], lab_configuration):
 
             sentiment = Sentiment(sentiment_score)
 
-            # Mock gender (since the model is untrained)
             gender = Gender(male=0.5, female=0.5)
 
-            # Age (untrained model — uniform distribution, sums to 1.0)
             age = Age(
                 below_twenty=0.25,
                 twenty_thirty=0.25,
@@ -265,10 +218,8 @@ def tag(documents: list[str], lab_configuration):
                 forty_more=0.25
             )
 
-            # Language score (untrained model)
             language_score = LanguageScore(1.0)
 
-            # Compile analysis
             analysis = Analysis(
                 classification=classification,
                 language_score=language_score,
@@ -285,10 +236,8 @@ def tag(documents: list[str], lab_configuration):
 
         except Exception as e:
             logging.error(f"Error processing document {idx}: {e}")
-            # Создаем fallback analysis
             _out.append(create_fallback_analysis())
 
-    # Финальная очистка памяти
     clear_gpu_memory()
     allocated_end, _ = get_gpu_memory_info()
     logging.info(f"GPU Memory at end: {allocated_end:.2f}GB")
@@ -297,12 +246,11 @@ def tag(documents: list[str], lab_configuration):
     return _out
 
 def create_fallback_analysis():
-    """Создает базовый анализ в случае ошибок"""
     return Analysis(
         classification=Classification(label="other", score=0.5),
         language_score=LanguageScore(1.0),
         sentiment=Sentiment(0.0),
-        embedding=Embedding([0.0] * 384),  # Размер для all-MiniLM-L6-v2
+        embedding=Embedding([0.0] * 384),
         gender=Gender(male=0.5, female=0.5),
         text_type=TextType(assumption=0.0, anecdote=0.0, none=1.0, definition=0.0, testimony=0.0, other=0.0, study=0.0),
         emotion=Emotion(love=0.0, admiration=0.0, joy=0.0, approval=0.0, caring=0.0, excitement=0.0, gratitude=0.0, desire=0.0, anger=0.0, optimism=0.0, disapproval=0.0, grief=0.0, annoyance=0.0, pride=0.0, curiosity=0.0, neutral=1.0, disgust=0.0, disappointment=0.0, realization=0.0, fear=0.0, relief=0.0, confusion=0.0, remorse=0.0, embarrassment=0.0, surprise=0.0, sadness=0.0, nervousness=0.0),

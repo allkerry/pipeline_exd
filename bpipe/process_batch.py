@@ -2,8 +2,8 @@ import logging
 from importlib import metadata
 from datetime import datetime, timezone
 import cupy as cp
-import numpy as np  # Добавляем numpy для fallback
-import gc  # Для сборки мусора
+import numpy as np
+import gc
 from exorde_data import (
     ProtocolItem,
     ProtocolAnalysis,
@@ -31,11 +31,9 @@ from exorde_data import (
 )
 from exorde_data import Url
 
-# Заглушки для Username и UserProfileUrl (если отсутствуют в exorde_data)
 try:
     from exorde_data import Username, UserProfileUrl
 except (ImportError, AttributeError):
-    # Создаём простые заглушки если их нет в exorde_data
     class Username(str):
         pass
 
@@ -46,7 +44,6 @@ from tag import tag
 from collections import Counter
 
 def clear_cupy_memory():
-    """Очистка CuPy памяти"""
     try:
         cp.get_default_memory_pool().free_all_blocks()
         cp.get_default_pinned_memory_pool().free_all_blocks()
@@ -78,7 +75,6 @@ def merge_chunks(chunks: list[ProcessedItem]) -> ProcessedItem:
 
         logging.info(f"[Item merging] Merging {len(chunks)} chunks.")
 
-        # Используем try-except для обработки CuPy операций
         try:
             for processed_item in chunks:
                 item_analysis_ = processed_item.analysis
@@ -93,12 +89,10 @@ def merge_chunks(chunks: list[ProcessedItem]) -> ProcessedItem:
                 irony_list.append(item_analysis_.irony)
                 age_list.append(item_analysis_.age)
 
-                # Осторожно работаем с embeddings
                 try:
                     embedding_array = cp.array(item_analysis_.embedding.vector)
                     embedding_list.append(embedding_array)
                 except cp.cuda.memory.OutOfMemoryError:
-                    # Fallback to numpy if GPU memory is low
                     logging.warning("GPU memory low, using numpy for embeddings")
                     embedding_array = np.array(item_analysis_.embedding.vector)
                     embedding_list.append(embedding_array)
@@ -112,7 +106,6 @@ def merge_chunks(chunks: list[ProcessedItem]) -> ProcessedItem:
             top_keywords_aggregated = list(set([kw for keywords in top_keywords_list for kw in keywords.keywords]))
             top_keywords_aggregated = Keywords(top_keywords_aggregated)
 
-            # Используем CuPy для числовых операций, с fallback на numpy
             try:
                 gender_aggregated = Gender(
                     male=float(cp.median(cp.array([x.male for x in gender_list]))),
@@ -120,10 +113,9 @@ def merge_chunks(chunks: list[ProcessedItem]) -> ProcessedItem:
                 )
                 sentiment_aggregated = Sentiment(float(cp.median(cp.array(sentiment_list))))
 
-                clear_cupy_memory()  # Очистка после каждой операции
+                clear_cupy_memory()
 
             except (cp.cuda.memory.OutOfMemoryError, RuntimeError):
-                # Fallback на numpy при нехватке GPU памяти
                 logging.warning("GPU memory insufficient, using numpy for aggregation")
                 gender_aggregated = Gender(
                     male=float(np.median([x.male for x in gender_list])),
@@ -133,7 +125,6 @@ def merge_chunks(chunks: list[ProcessedItem]) -> ProcessedItem:
 
             source_type_aggregated = SourceType(Most_Common(source_type_list))
 
-            # Аналогично для остальных агрегаций
             try:
                 text_type_aggregated = TextType(
                     assumption=float(cp.median(cp.array([tt.assumption for tt in text_type_list]))),
@@ -157,7 +148,6 @@ def merge_chunks(chunks: list[ProcessedItem]) -> ProcessedItem:
                     study=float(np.median([tt.study for tt in text_type_list])),
                 )
 
-            # Агрегация всех эмоций
             try:
                 emotion_aggregated = Emotion(
                     love=float(cp.median(cp.array([e.love for e in emotion_list]))),
@@ -235,7 +225,6 @@ def merge_chunks(chunks: list[ProcessedItem]) -> ProcessedItem:
                     thirty_forty=float(cp.median(cp.array([a.thirty_forty for a in age_list]))),
                     forty_more=float(cp.median(cp.array([a.forty_more for a in age_list]))),
                 )
-                # Если все нули — используем равномерное распределение
                 age_aggregated = _age_agg if sum([_age_agg.below_twenty, _age_agg.twenty_thirty, _age_agg.thirty_forty, _age_agg.forty_more]) > 0 else Age(below_twenty=0.25, twenty_thirty=0.25, thirty_forty=0.25, forty_more=0.25)
                 clear_cupy_memory()
 
@@ -255,30 +244,26 @@ def merge_chunks(chunks: list[ProcessedItem]) -> ProcessedItem:
                 )
                 age_aggregated = _age_agg if sum([_age_agg.below_twenty, _age_agg.twenty_thirty, _age_agg.thirty_forty, _age_agg.forty_more]) > 0 else Age(below_twenty=0.25, twenty_thirty=0.25, thirty_forty=0.25, forty_more=0.25)
 
-            # Embedding aggregation с особой осторожностью
             try:
                 if embedding_list:
                     if isinstance(embedding_list[0], cp.ndarray):
                         embedding_stack = cp.stack(embedding_list)
                         centroid_vector = cp.median(embedding_stack, axis=0)
-                        # Находим ближайший embedding
                         distances = [cp.linalg.norm(emb - centroid_vector) for emb in embedding_list]
                         closest_idx = cp.argmin(cp.array(distances))
                         closest_embedding = Embedding(list(embedding_list[int(closest_idx)].get().astype(float)))
                     else:
-                        # Numpy fallback
                         embedding_stack = np.stack(embedding_list)
                         centroid_vector = np.median(embedding_stack, axis=0)
                         distances = [np.linalg.norm(emb - centroid_vector) for emb in embedding_list]
                         closest_idx = np.argmin(distances)
                         closest_embedding = Embedding(list(embedding_list[closest_idx].astype(float)))
                 else:
-                    closest_embedding = Embedding([0.0] * 384)  # Default embedding size
+                    closest_embedding = Embedding([0.0] * 384)
 
                 clear_cupy_memory()
 
             except (cp.cuda.memory.OutOfMemoryError, RuntimeError, Exception):
-                # Fallback embedding
                 logging.warning("Error in embedding aggregation, using default")
                 closest_embedding = Embedding([0.0] * 384)
 
@@ -322,7 +307,6 @@ def merge_chunks(chunks: list[ProcessedItem]) -> ProcessedItem:
             merged_item = None
 
         finally:
-            # Финальная очистка памяти
             clear_cupy_memory()
 
     except Exception as e:
@@ -395,7 +379,10 @@ SOCIAL_DOMAINS = [
 
 
 def get_source_type(item: ProtocolItem) -> SourceType:
-    if item.domain in SOCIAL_DOMAINS:
+    domain = (item.domain or "").lower()
+    # Точное совпадение "twitter.com" пропускало "www.twitter.com" / "m.reddit.com" —
+    # теперь match по суффиксу домена.
+    if any(domain == d or domain.endswith("." + d) for d in SOCIAL_DOMAINS):
         return SourceType("social")
     return SourceType("news")
 
@@ -438,12 +425,9 @@ def process_batch(
         if processed.item.external_parent_id:
             prot_item['external_parent_id'] = processed.item.external_parent_id
 
-        # Pass through username if present
-        # MadType это dict, проверяем через 'in'
         if 'username' in processed.item and processed.item['username']:
             prot_item['username'] = Username(processed.item['username'])
 
-        # Pass through userprofile_url if present (future use)
         if 'userprofile_url' in processed.item and processed.item['userprofile_url']:
             prot_item['userprofile_url'] = UserProfileUrl(processed.item['userprofile_url'])
 
@@ -458,7 +442,6 @@ def process_batch(
             source_type=get_source_type(prot_item),
             emotion=analysis.emotion,
         )
-        # Inject missing fields required by Upload API schema directly into the madtype dict
         _analysis["gender"] = {"male": analysis.gender.male, "female": analysis.gender.female}
         _analysis["text_type"] = {
             "assumption": analysis.text_type.assumption,

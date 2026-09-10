@@ -1,16 +1,3 @@
-"""
-Upipe (standalone) — обрабатывает сырые твиты:
-  1. Препроцессинг текста
-  2. Перевод на английский (argostranslate)
-  3. Извлечение ключевых слов
-  4. Zero-shot классификация (DeBERTa)
-  5. Отправка обработанного элемента в bpipe (round-robin по нескольким инстансам)
-
-Слушает: POST / на UPIPE_PORT (по умолчанию 5981)
-Отправляет в: BPIPE_URLS — список URL через запятую
-  Пример: BPIPE_URLS=http://bpipe:7995/,http://bpipe_2:7996/
-  Если задан только BPIPE_URL — работает как раньше с одним инстансом.
-"""
 import asyncio
 import itertools
 import json
@@ -26,8 +13,6 @@ from aiohttp import web
 sys.path.insert(0, os.path.dirname(__file__))
 
 from exorde_data import Item, CreatedAt, Content, Domain, Url, Title, ExternalId, Author, ExternalParentId
-from exorde_compat import Username, UserProfileUrl
-from exorde_compat import Translation, Classification, Keywords, Processed
 from process import process
 from lab_initialization import lab_initialization
 
@@ -43,8 +28,6 @@ WORKERS      = int(os.getenv("UPIPE_WORKERS", "4"))
 QUEUE_LIMIT  = int(os.getenv("UPIPE_QUEUE_LIMIT", "200"))
 MAX_DEPTH_CLASSIFICATION = int(os.getenv("MAX_DEPTH_CLASSIFICATION", "2"))
 
-# Поддержка нескольких bpipe через BPIPE_URLS (через запятую)
-# Если BPIPE_URLS не задан — берём BPIPE_URL для обратной совместимости
 def _parse_bpipe_urls() -> list[str]:
     urls_env = os.getenv("BPIPE_URLS", "")
     if urls_env:
@@ -59,16 +42,13 @@ _lab_config: dict | None = None
 _process_queue: asyncio.Queue | None = None
 _thread_pool: ThreadPoolExecutor | None = None
 
-# Round-robin итератор по bpipe URL
 _bpipe_cycle: itertools.cycle | None = None
 _bpipe_lock = asyncio.Lock()
 
-# ─── Статистика ───────────────────────────────────────────────
 _stats = {"received": 0, "processed": 0, "forwarded": 0, "errors": 0, "dropped": 0}
 
 
 def _process_sync(item: Item, lab_config: dict) -> dict:
-    """Синхронная обработка (в отдельном потоке)."""
     processed = process(item, lab_config, MAX_DEPTH_CLASSIFICATION)
     return {
         "item": {
@@ -95,7 +75,6 @@ def _process_sync(item: Item, lab_config: dict) -> dict:
 
 
 async def forward_to_bpipe(payload: dict) -> bool:
-    """Отправляет в следующий bpipe по round-robin."""
     global _session, _bpipe_cycle
     if _session is None or _bpipe_cycle is None:
         return False
@@ -123,7 +102,6 @@ async def forward_to_bpipe(payload: dict) -> bool:
 
 
 async def worker_loop(worker_id: int):
-    """Воркер берёт элементы из очереди и обрабатывает их."""
     global _stats
     log.info(f"👷 Upipe-воркер #{worker_id} запущен")
 
@@ -221,8 +199,7 @@ async def handle_health(request: web.Request) -> web.Response:
 async def on_startup(app: web.Application):
     global _session, _lab_config, _process_queue, _thread_pool, _bpipe_cycle
 
-    log.info("🔬 Инициализация ML-моделей upipe...")
-    log.info("   (это займёт 1-3 минуты при первом запуске)")
+    log.info("🔬 Инициализация upipe...")
     log.info(f"   bpipe инстансов: {len(BPIPE_URLS)} → {BPIPE_URLS}")
 
     loop = asyncio.get_event_loop()

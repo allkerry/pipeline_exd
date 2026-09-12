@@ -1,7 +1,9 @@
-from langdetect import detect, DetectorFactory, LangDetectException
+import os
 from exorde_data import Translation, Language, Translated, Item
+from lang_detect import is_target_language
 
-DetectorFactory.seed = 0
+LANG_MIN_CONFIDENCE = float(os.getenv("LANG_MIN_CONFIDENCE", "0.9"))
+LANG_DETECT_MIN_LEN = int(os.getenv("LANG_DETECT_MIN_LEN", "30"))
 
 
 class NonEnglishError(ValueError):
@@ -10,13 +12,11 @@ class NonEnglishError(ValueError):
 
 def translate(item: Item, installed_languages, low_memory: bool = False) -> Translation:
     content = str(item.content)
-    try:
-        detected = detect(content)
-    except LangDetectException:
-        raise NonEnglishError("не удалось определить язык")
-
-    if detected != "en":
-        raise NonEnglishError(f"не-английский текст обнаружен: {detected}")
+    passed, detected_lang, confidence = is_target_language(
+        content, "en", LANG_MIN_CONFIDENCE, LANG_DETECT_MIN_LEN
+    )
+    if not passed:
+        raise NonEnglishError(f"не-английский/неопределённый текст: lang={detected_lang} confidence={confidence:.3f}")
 
     return Translation(
         language=Language("en"),

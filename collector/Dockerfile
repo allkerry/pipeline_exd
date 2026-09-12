@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir \
     "orjson>=3.9.0" \
     "langdetect>=1.0.9"
 
-COPY collector.py .
+COPY lang_detect.py collector.py .
 
 HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
     CMD curl -f http://localhost:9000/health || exit 1

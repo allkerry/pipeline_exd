@@ -16,9 +16,8 @@ from datetime import datetime, timezone
 import aiohttp
 import orjson
 from aiohttp import web
-from langdetect import detect, DetectorFactory, LangDetectException
 
-DetectorFactory.seed = 0
+from lang_detect import is_target_language
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,6 +32,8 @@ MIN_TEXT_LEN         = int(os.getenv("MIN_TEXT_LEN", "20"))
 MAX_TEXT_LEN         = int(os.getenv("MAX_TEXT_LEN", "20000"))
 MAX_OLDNESS_SECONDS = int(os.getenv("MAX_OLDNESS_SECONDS", "86400"))
 LANG_FILTER          = os.getenv("LANG_FILTER", "en").strip().lower()
+LANG_MIN_CONFIDENCE  = float(os.getenv("LANG_MIN_CONFIDENCE", "0.9"))
+LANG_DETECT_MIN_LEN  = int(os.getenv("LANG_DETECT_MIN_LEN", "30"))
 
 # ─── Дедупликация ─────────────────────────────────────────────
 _seen_ids: OrderedDict = OrderedDict()
@@ -84,14 +85,10 @@ def _parse_created_at(created_at_str: str) -> datetime | None:
         return None
 
 
-def _passes_lang_filter(content: str) -> bool:
+def _passes_lang_filter(content: str) -> tuple[bool, str, float]:
     if not LANG_FILTER:
-        return True
-    try:
-        return detect(content) == LANG_FILTER
-    except LangDetectException:
-        # Неопределяемый язык — не пропускаем дальше без проверки, дропаем.
-        return False
+        return True, "-", 1.0
+    return is_target_language(content, LANG_FILTER, LANG_MIN_CONFIDENCE, LANG_DETECT_MIN_LEN)
 
 
 async def handle_store_item(request: web.Request) -> web.Response:
@@ -121,8 +118,10 @@ async def handle_store_item(request: web.Request) -> web.Response:
     if len(content) < MIN_TEXT_LEN:
         return web.json_response({"message": "skipped_short"}, status=200)
 
-    if not _passes_lang_filter(content):
+    lang_ok, detected_lang, confidence = _passes_lang_filter(content)
+    if not lang_ok:
         _stats["filtered_lang"] += 1
+        log.info(f"🌐 filtered_lang | detected={detected_lang} confidence={confidence:.3f} | {content[:60]!r}")
         return web.json_response({"message": "filtered_lang"}, status=200)
 
     if len(content) > MAX_TEXT_LEN:
@@ -166,6 +165,8 @@ async def handle_health(request: web.Request) -> web.Response:
         "stats": _stats,
         "upipe": UPIPE_URL,
         "lang_filter": LANG_FILTER or None,
+        "lang_min_confidence": LANG_MIN_CONFIDENCE,
+        "lang_detect_min_len": LANG_DETECT_MIN_LEN,
     })
 
 
@@ -175,7 +176,7 @@ async def on_startup(app: web.Application):
     _session = aiohttp.ClientSession(connector=connector)
     log.info(f"🚀 Collector запущен на порту {COLLECTOR_PORT}")
     log.info(f"   Пересылает в upipe: {UPIPE_URL}")
-    log.info(f"   Языковой фильтр: {LANG_FILTER or 'выключен'}")
+    log.info(f"   Языковой фильтр: {LANG_FILTER or 'выключен'} (min_confidence={LANG_MIN_CONFIDENCE}, min_len={LANG_DETECT_MIN_LEN})")
     log.info(f"   Макс. возраст твита: {MAX_OLDNESS_SECONDS}с ({MAX_OLDNESS_SECONDS/3600:.1f}ч)")
 
 

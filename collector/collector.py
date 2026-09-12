@@ -1,10 +1,3 @@
-"""
-Collector — мост между Twitter-скрапером и upipe.
-
-Схема:
-  scraper  → POST /store_item (port 9000)  → collector
-  collector → POST /         (port 5981)  → upipe
-"""
 import asyncio
 import hashlib
 import logging
@@ -16,7 +9,7 @@ from datetime import datetime, timezone
 import aiohttp
 import orjson
 from aiohttp import web
-from langdetect import detect_langs, DetectorFactory, LangDetectException
+from langdetect import detect, DetectorFactory, LangDetectException
 
 DetectorFactory.seed = 0
 
@@ -33,13 +26,10 @@ MIN_TEXT_LEN         = int(os.getenv("MIN_TEXT_LEN", "20"))
 MAX_TEXT_LEN         = int(os.getenv("MAX_TEXT_LEN", "20000"))
 MAX_OLDNESS_SECONDS = int(os.getenv("MAX_OLDNESS_SECONDS", "86400"))
 LANG_FILTER          = os.getenv("LANG_FILTER", "en").strip().lower()
-LANG_CONFIDENCE_THRESHOLD = float(os.getenv("LANG_CONFIDENCE_THRESHOLD", "0.90"))
 
-# ─── Дедупликация ─────────────────────────────────────────────
 _seen_ids: OrderedDict = OrderedDict()
 _DEDUP_MAX_SIZE = 100_000
 
-# ─── Статистика ───────────────────────────────────────────────
 _stats = {"received": 0, "forwarded": 0, "filtered_old": 0, "filtered_dup": 0, "filtered_lang": 0, "truncated": 0, "errors": 0, "dropped": 0}
 _session: aiohttp.ClientSession | None = None
 
@@ -51,7 +41,6 @@ def _hash_author(author: str) -> str:
 
 
 async def forward_to_upipe(item: dict) -> bool:
-    """Отправляет item в upipe. Возвращает True при успехе."""
     global _session
     if _session is None:
         return False
@@ -71,7 +60,6 @@ async def forward_to_upipe(item: dict) -> bool:
 
 
 def _parse_created_at(created_at_str: str) -> datetime | None:
-    """Парсит ISO8601 строку created_at в datetime (UTC). Возвращает None при ошибке."""
     if not created_at_str:
         return None
     try:
@@ -86,27 +74,12 @@ def _parse_created_at(created_at_str: str) -> datetime | None:
 
 
 def _passes_lang_filter(content: str) -> bool:
-    """
-    Дропаем только при уверенном не-целевом языке. Мусор (без букв) и
-    неопределяемый/малоуверенный результат langdetect пропускаем дальше —
-    финальное решение по содержимому принимает upipe (translate.py).
-    """
     if not LANG_FILTER:
         return True
-    if not content or not any(c.isalpha() for c in content):
-        return True
     try:
-        candidates = detect_langs(content)
+        return detect(content) == LANG_FILTER
     except LangDetectException:
-        return True
-    if not candidates:
-        return True
-    top = candidates[0]
-    if top.lang == LANG_FILTER:
-        return True
-    if top.prob < LANG_CONFIDENCE_THRESHOLD:
-        return True
-    return False
+        return False
 
 
 async def handle_store_item(request: web.Request) -> web.Response:
@@ -136,14 +109,16 @@ async def handle_store_item(request: web.Request) -> web.Response:
     if len(content) < MIN_TEXT_LEN:
         return web.json_response({"message": "skipped_short"}, status=200)
 
-    if not _passes_lang_filter(content):
-        _stats["filtered_lang"] += 1
-        return web.json_response({"message": "filtered_lang"}, status=200)
-
+    # Обрезаем ДО lang-detect: langdetect на очень длинных/повторяющихся
+    # текстах (>MAX_TEXT_LEN) даёт ложные срабатывания не-en языка.
     if len(content) > MAX_TEXT_LEN:
         content = content[:MAX_TEXT_LEN]
         item["content"] = content
         _stats["truncated"] = _stats.get("truncated", 0) + 1
+
+    if not _passes_lang_filter(content):
+        _stats["filtered_lang"] += 1
+        return web.json_response({"message": "filtered_lang"}, status=200)
 
     created_at_str = item.get("created_at", "")
     tweet_dt = _parse_created_at(created_at_str)
@@ -190,7 +165,7 @@ async def on_startup(app: web.Application):
     _session = aiohttp.ClientSession(connector=connector)
     log.info(f"🚀 Collector запущен на порту {COLLECTOR_PORT}")
     log.info(f"   Пересылает в upipe: {UPIPE_URL}")
-    log.info(f"   Языковой фильтр: {LANG_FILTER or 'выключен'} (порог уверенности={LANG_CONFIDENCE_THRESHOLD})")
+    log.info(f"   Языковой фильтр: {LANG_FILTER or 'выключен'}")
     log.info(f"   Макс. возраст твита: {MAX_OLDNESS_SECONDS}с ({MAX_OLDNESS_SECONDS/3600:.1f}ч)")
 
 

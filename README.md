@@ -10,7 +10,7 @@
 
 Что внутри и почему именно так — коротко:
 - **collector** — принимает тексты, фильтрует язык/дубликаты/мусор, режет экстремально большие пейлоады.
-- **upipe** — переводит, извлекает keywords, **обрезает текст по реальному числу токенов** (чтобы GPU не падал), классифицирует.
+- **upipe** — переводит, извлекает keywords, **отбрасывает item, если реальное число токенов превышает лимит** (чтобы GPU не падал), классифицирует.
 - **bpipe** — тяжёлый ML: эмбеддинги, sentiment, emotion, zero-shot classification и т.д. на GPU (ONNX Runtime).
 - **transactioneer** — грузит готовые батчи в Exorde Upload API, **через VPN**.
 - **vpn** — Xray-core (VLESS + REALITY + Vision, с поддержкой пост-квантовой верификации), поднимает SOCKS5 (1080) и HTTP (1081) прокси внутри docker-сети.
@@ -166,6 +166,8 @@ curl -X POST http://localhost:9000/store_item \
 
 ### 4.6. Экстремально длинный текст — не должен ронять батч (главная проверка твоего требования)
 
+Токен-лимит (`MAX_MODEL_TOKENS`, по умолчанию 400) больше не обрезает текст — item, превышающий лимит, **отбрасывается целиком** на этапе upipe, до GPU:
+
 ```bash
 LONG_TEXT=$(python3 -c "print(('This is a very long repeated sentence about markets and finance and technology. ' * 400))")
 curl -X POST http://localhost:9000/store_item \
@@ -173,14 +175,14 @@ curl -X POST http://localhost:9000/store_item \
   -d "{\"content\": \"$LONG_TEXT\", \"external_id\": \"test-long-001\", \"created_at\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\", \"domain\": \"twitter.com\", \"url\": \"https://twitter.com/test/status/3\"}"
 ```
 ```bash
-docker compose logs -f upipe | grep "✂️"
+docker compose logs -f upipe | grep -i "Токен-лимит превышен"
 ```
-Должна появиться строка вида `✂️ Текст обрезан по токенам (лимит=400, итог=400)`.
+Должна появиться строка вида `⚠️ [N] Ошибка обработки: Токен-лимит превышен (XXXX > 400), item отброшен`. Это ожидаемое поведение — не баг.
 
 ```bash
 docker compose logs -f bpipe | grep -i error
 ```
-Не должно быть `CUDA OOM`, `RuntimeError`, `IndexError` — это и есть проверка, что длинный текст больше не роняет батч целиком (раньше упавший batch возвращал `[]` и терял ВСЕ элементы батча, включая нормальные тексты рядом с длинным).
+Не должно быть `CUDA OOM`, `RuntimeError`, `IndexError` — длинный текст до bpipe вообще не доходит, батч не может из-за него упасть.
 
 ### 4.7. Пустой / мусорный текст после перевода
 
@@ -189,7 +191,7 @@ curl -X POST http://localhost:9000/store_item \
   -H "Content-Type: application/json" \
   -d '{"content": "!!!!!!!!!! ################ 1234567890", "external_id": "test-junk-001", "created_at": "'"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"'", "domain": "twitter.com", "url": "https://twitter.com/test/status/4"}'
 ```
-В `docker compose logs upipe` должна быть ошибка `No content to work with` (или `... after token truncation`) — элемент корректно отбрасывается, а не роняет сервис.
+В `docker compose logs upipe` должна быть ошибка `No content to work with` — элемент корректно отбрасывается, а не роняет сервис.
 
 ### 4.8. GPU-память под нагрузкой (проверка, что 8GB хватает)
 

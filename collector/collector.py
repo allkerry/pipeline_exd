@@ -26,6 +26,8 @@ MIN_TEXT_LEN         = int(os.getenv("MIN_TEXT_LEN", "20"))
 MAX_TEXT_LEN         = int(os.getenv("MAX_TEXT_LEN", "20000"))
 MAX_OLDNESS_SECONDS = int(os.getenv("MAX_OLDNESS_SECONDS", "86400"))
 LANG_FILTER          = os.getenv("LANG_FILTER", "en").strip().lower()
+BATCH_MAX_ITEMS      = int(os.getenv("BATCH_MAX_ITEMS", "1000"))
+BATCH_CONCURRENCY    = int(os.getenv("BATCH_CONCURRENCY", "20"))
 
 _seen_ids: OrderedDict = OrderedDict()
 _DEDUP_MAX_SIZE = 100_000
@@ -82,13 +84,9 @@ def _passes_lang_filter(content: str) -> bool:
         return False
 
 
-async def handle_store_item(request: web.Request) -> web.Response:
+async def _process_item(item: dict) -> str:
+    """Общий пайплайн фильтрации одного item. Возвращает message как в /store_item."""
     global _stats
-    try:
-        item = await request.json()
-    except Exception as e:
-        return web.json_response({"error": f"Invalid JSON: {e}"}, status=400)
-
     _stats["received"] += 1
     content = item.get("content", "")
 
@@ -98,8 +96,7 @@ async def handle_store_item(request: web.Request) -> web.Response:
     if ext_id:
         if ext_id in _seen_ids:
             _stats["filtered_dup"] += 1
-            log.debug(f"♻️ Дубликат: {ext_id}")
-            return web.json_response({"message": "duplicate"}, status=200)
+            return "duplicate"
         _seen_ids[ext_id] = True
         _seen_ids.move_to_end(ext_id)
         if len(_seen_ids) > _DEDUP_MAX_SIZE:
@@ -107,18 +104,16 @@ async def handle_store_item(request: web.Request) -> web.Response:
                 _seen_ids.popitem(last=False)
 
     if len(content) < MIN_TEXT_LEN:
-        return web.json_response({"message": "skipped_short"}, status=200)
+        return "skipped_short"
 
-    # Обрезаем ДО lang-detect: langdetect на очень длинных/повторяющихся
-    # текстах (>MAX_TEXT_LEN) даёт ложные срабатывания не-en языка.
+    if not _passes_lang_filter(content):
+        _stats["filtered_lang"] += 1
+        return "filtered_lang"
+
     if len(content) > MAX_TEXT_LEN:
         content = content[:MAX_TEXT_LEN]
         item["content"] = content
         _stats["truncated"] = _stats.get("truncated", 0) + 1
-
-    if not _passes_lang_filter(content):
-        _stats["filtered_lang"] += 1
-        return web.json_response({"message": "filtered_lang"}, status=200)
 
     created_at_str = item.get("created_at", "")
     tweet_dt = _parse_created_at(created_at_str)
@@ -126,8 +121,7 @@ async def handle_store_item(request: web.Request) -> web.Response:
         age_seconds = (datetime.now(timezone.utc) - tweet_dt).total_seconds()
         if age_seconds > MAX_OLDNESS_SECONDS:
             _stats["filtered_old"] += 1
-            log.debug(f"🕒 Устарел ({age_seconds/3600:.1f}ч): {content[:60]}")
-            return web.json_response({"message": "filtered_old"}, status=200)
+            return "filtered_old"
     else:
         log.warning(f"⚠️ Не удалось распарсить created_at: {created_at_str!r}")
 
@@ -143,11 +137,61 @@ async def handle_store_item(request: web.Request) -> web.Response:
         _stats["errors"] += 1
         _stats["dropped"] += 1
         if _stats["dropped"] % 10 == 0:
-            log.warning(
-                f"⚠️  Потеряно элементов (upipe недоступен/503): {_stats['dropped']}"
-            )
+            log.warning(f"⚠️  Потеряно элементов (upipe недоступен/503): {_stats['dropped']}")
 
-    return web.json_response({"message": "OK"}, status=200)
+    return "OK"
+
+
+async def handle_store_item(request: web.Request) -> web.Response:
+    try:
+        item = await request.json()
+    except Exception as e:
+        return web.json_response({"error": f"Invalid JSON: {e}"}, status=400)
+
+    message = await _process_item(item)
+    return web.json_response({"message": message}, status=200)
+
+
+async def handle_store_batch(request: web.Request) -> web.Response:
+    try:
+        items = await request.json()
+    except Exception as e:
+        return web.json_response({"error": f"Invalid JSON: {e}"}, status=400)
+
+    if not isinstance(items, list):
+        return web.json_response({"error": "expected array"}, status=400)
+
+    if not items:
+        return web.json_response({"received": 0, "results": []}, status=200)
+
+    if len(items) > BATCH_MAX_ITEMS:
+        return web.json_response(
+            {"error": f"batch too large: {len(items)} > {BATCH_MAX_ITEMS}"}, status=413
+        )
+
+    sem = asyncio.Semaphore(BATCH_CONCURRENCY)
+
+    async def _guarded(it):
+        if not isinstance(it, dict):
+            return "invalid_item"
+        async with sem:
+            try:
+                return await _process_item(it)
+            except Exception as e:
+                log.warning(f"Ошибка обработки item в батче: {e}")
+                return "error"
+
+    results = await asyncio.gather(*[_guarded(it) for it in items])
+
+    summary: dict = {}
+    for r in results:
+        summary[r] = summary.get(r, 0) + 1
+
+    log.info(f"📦 Батч обработан: {len(items)} элементов | {summary}")
+
+    return web.json_response(
+        {"received": len(items), "summary": summary, "results": results}, status=200
+    )
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -156,6 +200,7 @@ async def handle_health(request: web.Request) -> web.Response:
         "stats": _stats,
         "upipe": UPIPE_URL,
         "lang_filter": LANG_FILTER or None,
+        "batch_max_items": BATCH_MAX_ITEMS,
     })
 
 
@@ -167,6 +212,7 @@ async def on_startup(app: web.Application):
     log.info(f"   Пересылает в upipe: {UPIPE_URL}")
     log.info(f"   Языковой фильтр: {LANG_FILTER or 'выключен'}")
     log.info(f"   Макс. возраст твита: {MAX_OLDNESS_SECONDS}с ({MAX_OLDNESS_SECONDS/3600:.1f}ч)")
+    log.info(f"   Батчи: до {BATCH_MAX_ITEMS} items, конкурентность {BATCH_CONCURRENCY}")
 
 
 async def on_shutdown(app: web.Application):
@@ -176,8 +222,9 @@ async def on_shutdown(app: web.Application):
     log.info(f"📊 Итог: {_stats}")
 
 
-app = web.Application(client_max_size=10 * 1024 * 1024)
+app = web.Application(client_max_size=50 * 1024 * 1024)
 app.router.add_post("/store_item", handle_store_item)
+app.router.add_post("/store_items", handle_store_batch)
 app.router.add_get("/health", handle_health)
 app.on_startup.append(on_startup)
 app.on_shutdown.append(on_shutdown)

@@ -213,6 +213,7 @@ async def handle_receive_item(request: web.Request) -> web.Response:
         author_value         = raw_item["item"].get("author") or ""
         title_value          = raw_item["item"].get("title") or ""
         ext_parent_id        = raw_item["item"].get("external_parent_id") or ""
+        summary_value        = raw_item["item"].get("summary") or ""
 
         processed_item = Processed(
             classification=Classification(
@@ -239,6 +240,8 @@ async def handle_receive_item(request: web.Request) -> web.Response:
             processed_item.item["external_parent_id"] = ExternalParentId(ext_parent_id)
         if raw_item["item"].get("username"):
             processed_item.item["username"] = Username(raw_item["item"]["username"])
+        if summary_value:
+            processed_item.item["summary"] = summary_value
 
     except Exception as e:
         log.warning(f"Ошибка создания Processed: {e}")

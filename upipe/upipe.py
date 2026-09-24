@@ -122,6 +122,8 @@ async def worker_loop(worker_id: int):
 
                 if raw_item.get("username"):
                     payload["item"]["username"] = raw_item["username"]
+                if raw_item.get("summary"):
+                    payload["item"]["summary"] = raw_item["summary"]
 
                 ok = await forward_to_bpipe(payload)
                 if ok:
@@ -133,10 +135,8 @@ async def worker_loop(worker_id: int):
                     _stats["errors"] += 1
 
             except NonEnglishError as e:
-                # Раньше логировалось на DEBUG при работающем на INFO сервисе —
-                # дропы происходили без единого следа в логах. Теперь INFO.
                 _stats["filtered_lang"] += 1
-                log.info(f"🌐 [{worker_id}] Не-английский текст отброшен: {e}")
+                log.debug(f"🌐 [{worker_id}] Не-английский текст отброшен: {e}")
 
             except Exception as e:
                 _stats["errors"] += 1
